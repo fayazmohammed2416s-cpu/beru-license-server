@@ -3,8 +3,19 @@
 // A minimal license backend for the BERU MT4 indicator. Tracks which
 // MT4 account numbers are currently licensed, and until when. The
 // indicator calls GET /check?account=... every few minutes; you manage
-// licenses through the /admin endpoints (used by admin.html) or by
-// editing licenses.json directly.
+// licenses through the /admin endpoints (used by admin.html).
+//
+// STORAGE: licenses are stored in Upstash Redis (a free, permanent
+// cloud key-value store) instead of a local file. This matters because
+// hosts like Render's free tier wipe the local disk on every restart -
+// a plain licenses.json file would silently lose every license you'd
+// granted. Upstash persists forever regardless of restarts/redeploys.
+//
+// Setup: create a free database at upstash.com, then set these two
+// environment variables wherever you deploy this (Render > your
+// service > Environment):
+//   UPSTASH_REDIS_REST_URL   - from the Upstash dashboard
+//   UPSTASH_REDIS_REST_TOKEN - from the Upstash dashboard
 //
 // Run locally:   npm install && npm start
 // Then set ADMIN_KEY (see below) and deploy somewhere reachable over
@@ -14,7 +25,6 @@
 // ---------------------------------------------------------------
 
 const express = require("express");
-const fs = require("fs");
 const path = require("path");
 
 const app = express();
@@ -35,27 +45,52 @@ app.use((req, res, next) => {
   next();
 });
 
-const DB_FILE = path.join(__dirname, "licenses.json");
 const PORT = process.env.PORT || 3000;
-
-// Change this before deploying! Whoever knows this key can add, revoke,
-// or list every license, so treat it like a password (set it via the
-// ADMIN_KEY environment variable in production - do not commit a real
-// key to source control).
 const ADMIN_KEY = process.env.ADMIN_KEY || "change-this-admin-key";
 
-function loadDB() {
-  if (!fs.existsSync(DB_FILE)) return {};
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const REDIS_KEY = "beru_licenses_db"; // single key holding the whole licenses object as JSON
+
+if (!UPSTASH_URL || !UPSTASH_TOKEN) {
+  console.warn("WARNING: UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN are not set.");
+  console.warn("Licenses will NOT persist across restarts until these are set (see comment at top of this file).");
+}
+
+// ---------------------------------------------------------------
+// loadDB / saveDB - talk to Upstash's REST API directly (no extra
+// npm package needed; Node 18+ has fetch built in). Falls back to an
+// in-memory object if Upstash isn't configured yet, so the server
+// still runs for local testing - it just won't remember anything
+// between restarts in that case.
+// ---------------------------------------------------------------
+let memoryFallback = {};
+
+async function loadDB() {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return memoryFallback;
   try {
-    return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+    const res = await fetch(`${UPSTASH_URL}/get/${REDIS_KEY}`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+    });
+    const data = await res.json();
+    if (!data.result) return {};
+    return JSON.parse(data.result);
   } catch (e) {
-    console.error("Failed to parse licenses.json, starting empty:", e.message);
+    console.error("Failed to load licenses from Upstash:", e.message);
     return {};
   }
 }
 
-function saveDB(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+async function saveDB(db) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) {
+    memoryFallback = db;
+    return;
+  }
+  await fetch(`${UPSTASH_URL}/set/${REDIS_KEY}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+    body: JSON.stringify(db),
+  });
 }
 
 function requireAdmin(req, res, next) {
@@ -71,11 +106,11 @@ function requireAdmin(req, res, next) {
 // Called by the MT4 indicator itself. Public (no admin key needed) -
 // it only reveals whether ONE account number is currently valid.
 // ---------------------------------------------------------------
-app.get("/check", (req, res) => {
+app.get("/check", async (req, res) => {
   const account = String(req.query.account || "");
   if (!account) return res.json({ valid: false });
 
-  const db = loadDB();
+  const db = await loadDB();
   const entry = db[account];
 
   if (!entry) return res.json({ valid: false });
@@ -92,8 +127,8 @@ app.get("/check", (req, res) => {
 // ---------------------------------------------------------------
 // GET /admin/list  - all licenses, admin key required
 // ---------------------------------------------------------------
-app.get("/admin/list", requireAdmin, (req, res) => {
-  const db = loadDB();
+app.get("/admin/list", requireAdmin, async (req, res) => {
+  const db = await loadDB();
   const rows = Object.keys(db).map((account) => ({
     account,
     ...db[account],
@@ -108,11 +143,11 @@ app.get("/admin/list", requireAdmin, (req, res) => {
 // 1 year = 31536000. Omit both duration fields for a license with no
 // expiry (valid until you revoke it manually).
 // ---------------------------------------------------------------
-app.post("/admin/set", requireAdmin, (req, res) => {
+app.post("/admin/set", requireAdmin, async (req, res) => {
   const { account, durationSeconds, expiresAt, note } = req.body || {};
   if (!account) return res.status(400).json({ error: "account is required" });
 
-  const db = loadDB();
+  const db = await loadDB();
   let expires = null;
   if (expiresAt) expires = Number(expiresAt);
   else if (durationSeconds) expires = Date.now() + Number(durationSeconds) * 1000;
@@ -123,7 +158,7 @@ app.post("/admin/set", requireAdmin, (req, res) => {
     note: note || "",
     updatedAt: Date.now(),
   };
-  saveDB(db);
+  await saveDB(db);
   res.json({ ok: true, account, expiresAt: expires });
 });
 
@@ -133,28 +168,28 @@ app.post("/admin/set", requireAdmin, (req, res) => {
 // its next check-in (within LicenseCheckIntervalMinutes, or up to
 // OfflineGraceHours later if that customer happened to be offline).
 // ---------------------------------------------------------------
-app.post("/admin/revoke", requireAdmin, (req, res) => {
+app.post("/admin/revoke", requireAdmin, async (req, res) => {
   const { account } = req.body || {};
   if (!account) return res.status(400).json({ error: "account is required" });
 
-  const db = loadDB();
+  const db = await loadDB();
   if (!db[String(account)]) db[String(account)] = {};
   db[String(account)].revoked = true;
   db[String(account)].updatedAt = Date.now();
-  saveDB(db);
+  await saveDB(db);
   res.json({ ok: true, account, revoked: true });
 });
 
 // ---------------------------------------------------------------
 // POST /admin/delete   { account }  - remove an account entirely
 // ---------------------------------------------------------------
-app.post("/admin/delete", requireAdmin, (req, res) => {
+app.post("/admin/delete", requireAdmin, async (req, res) => {
   const { account } = req.body || {};
   if (!account) return res.status(400).json({ error: "account is required" });
 
-  const db = loadDB();
+  const db = await loadDB();
   delete db[String(account)];
-  saveDB(db);
+  await saveDB(db);
   res.json({ ok: true, account, deleted: true });
 });
 
