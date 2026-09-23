@@ -1,0 +1,12 @@
+{
+  "name": "beru-license-server",
+  "version": "1.0.0",
+  "description": "Minimal license backend for the BERU MT4 indicator - check/set/revoke accounts.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

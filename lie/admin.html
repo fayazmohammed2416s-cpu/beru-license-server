@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BERU License Admin</title>
+<style>
+  :root {
+    --bg: #08060f;
+    --panel: #120b1e;
+    --accent: #be46ff;
+    --accent2: #00e1ff;
+    --text: #e8e6f4;
+    --sub: #968fb8;
+    --green: #46eb96;
+    --red: #fa4670;
+    --gold: #ffc540;
+    --divider: #2c2044;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+  }
+  h1 {
+    font-size: 28px;
+    margin: 0 0 4px 0;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .sub { color: var(--sub); margin-bottom: 24px; font-size: 13px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--divider);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  label { display: block; font-size: 13px; color: var(--sub); margin-bottom: 4px; margin-top: 12px; }
+  input, select, button {
+    font-family: inherit;
+    font-size: 14px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--divider);
+    background: #0d0818;
+    color: var(--text);
+  }
+  input, select { width: 100%; }
+  button {
+    cursor: pointer;
+    border: none;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    color: #08060f;
+    font-weight: bold;
+    margin-top: 16px;
+    padding: 10px 16px;
+  }
+  button.secondary {
+    background: transparent;
+    border: 1px solid var(--divider);
+    color: var(--text);
+    font-weight: normal;
+    margin-top: 0;
+  }
+  button.danger { background: var(--red); color: #08060f; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--divider); font-size: 13px; }
+  th { color: var(--sub); font-weight: normal; }
+  .status-active { color: var(--green); font-weight: bold; }
+  .status-revoked { color: var(--red); font-weight: bold; }
+  .status-expired { color: var(--gold); font-weight: bold; }
+  .row-actions button { margin: 0 4px 0 0; padding: 6px 10px; font-size: 12px; }
+  #msg { font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .ok { color: var(--green); }
+  .err { color: var(--red); }
+</style>
+</head>
+<body>
+
+<h1>BERU LICENSE ADMIN</h1>
+<div class="sub">Manage which MT4 accounts can use the indicator, and for how long. Runs against this same server's /admin endpoints.</div>
+
+<div class="card">
+  <label>Server URL</label>
+  <input id="serverUrl" type="text" placeholder="e.g. https://your-app.onrender.com (where server.js is deployed)" />
+  <div class="sub" style="margin-top:6px;">The address running <code>server.js</code> itself - NOT wherever this admin.html page happens to be hosted (a static host like Netlify/GitHub Pages/Vercel can serve this file but can't run the backend). Remembered in this browser.</div>
+
+  <label>Admin key</label>
+  <input id="adminKey" type="password" placeholder="Paste your ADMIN_KEY here" />
+  <div class="sub" style="margin-top:6px;">Stored only in this browser tab's memory - not saved anywhere.</div>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0;">Add / update a license</h3>
+  <label>MT4 account number</label>
+  <input id="account" type="text" placeholder="e.g. 12345678" />
+
+  <label>Duration</label>
+  <select id="duration">
+    <option value="3600">1 hour</option>
+    <option value="60">1 minute</option>
+    <option value="86400" selected>1 day</option>
+    <option value="2592000">1 month (30 days)</option>
+    <option value="31536000">1 year</option>
+    <option value="custom">Custom (hours)</option>
+    <option value="0">No expiry (until manually revoked)</option>
+  </select>
+  <input id="customHours" type="number" placeholder="Custom hours" style="display:none; margin-top:8px;" />
+
+  <label>Note (optional, e.g. customer name)</label>
+  <input id="note" type="text" placeholder="e.g. John - Telegram order #42" />
+
+  <button onclick="addLicense()">Grant / Update License</button>
+  <div id="msg"></div>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0;">Licenses</h3>
+  <button class="secondary" onclick="loadLicenses()">Refresh</button>
+  <table id="licTable">
+    <thead>
+      <tr><th>Account</th><th>Status</th><th>Expires</th><th>Note</th><th>Actions</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<script>
+document.getElementById('duration').addEventListener('change', (e) => {
+  document.getElementById('customHours').style.display = e.target.value === 'custom' ? 'block' : 'none';
+});
+
+// Remember the server URL across visits (this is just a convenience URL
+// string, not a secret) so you don't have to retype it every time. We do
+// NOT default this to the page's own address: static hosts (Netlify,
+// GitHub Pages, Vercel static, etc.) can serve this HTML file just fine
+// but have no Node/Express process behind them, so assuming "this page's
+// own URL" is the API would silently point requests at a host that will
+// never have /admin/set. The field starts blank until you paste your
+// actual server's address.
+const serverUrlInput = document.getElementById('serverUrl');
+try {
+  const saved = localStorage.getItem('beruAdminServerUrl');
+  if (saved) serverUrlInput.value = saved;
+} catch (e) { /* localStorage unavailable - fine, field just starts empty */ }
+
+serverUrlInput.addEventListener('change', () => {
+  try { localStorage.setItem('beruAdminServerUrl', serverUrlInput.value.trim()); } catch (e) {}
+});
+
+// Builds a full request URL. Always prefer the typed Server URL - it's the
+// only reliable signal, since this page can be hosted anywhere (a static
+// host, file://, or the license server itself).
+function apiUrl(path) {
+  const base = serverUrlInput.value.trim().replace(/\/+$/, '');
+  if (base) return base + path;
+  if (location.protocol.startsWith('http')) return path; // best-effort fallback only
+  throw new Error('Enter the Server URL above first - the address where server.js is actually running (e.g. https://your-app.onrender.com). This page alone has no backend.');
+}
+
+function adminHeaders() {
+  return { 'Content-Type': 'application/json', 'x-admin-key': document.getElementById('adminKey').value };
+}
+
+// Shared fetch+parse: reads the response as text first so a non-JSON
+// response (an HTML error/404 page from a static host, a proxy, a wrong
+// URL, etc.) produces a clear explanation instead of a raw parser error.
+async function apiFetch(path, options) {
+  let res;
+  try {
+    res = await fetch(apiUrl(path), options);
+  } catch (e) {
+    throw new Error('Could not reach that Server URL at all (' + e.message + '). Check it is correct, includes https://, the server is actually running, and - if deployed - that it allows requests from this page (CORS).');
+  }
+  const raw = await res.text();
+  let data;
+  try {
+    data = raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    if (raw.trim().startsWith('<')) {
+      throw new Error('That Server URL returned a webpage, not the license server\'s JSON (likely a 404 or wrong host). Static hosts like Netlify/GitHub Pages/Vercel can serve this admin.html file but cannot run server.js - deploy server.js separately (Render, Railway, Fly.io, or a VPS) and put THAT address here instead.');
+    }
+    throw new Error('Server returned something that was not valid JSON: ' + raw.slice(0, 120));
+  }
+  if (!res.ok) throw new Error(data.error || ('request failed (' + res.status + ')'));
+  return data;
+}
+
+function showMsg(text, ok) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = ok ? 'ok' : 'err';
+}
+
+async function addLicense() {
+  const account = document.getElementById('account').value.trim();
+  const note = document.getElementById('note').value.trim();
+  const durationSel = document.getElementById('duration').value;
+  let durationSeconds = null;
+
+  if (!account) { showMsg('Account number is required.', false); return; }
+
+  if (durationSel === 'custom') {
+    const hrs = parseFloat(document.getElementById('customHours').value);
+    if (!hrs || hrs <= 0) { showMsg('Enter a valid number of custom hours.', false); return; }
+    durationSeconds = Math.round(hrs * 3600);
+  } else if (durationSel === '0') {
+    durationSeconds = null; // no expiry
+  } else {
+    durationSeconds = parseInt(durationSel, 10);
+  }
+
+  try {
+    await apiFetch('/admin/set', {
+      method: 'POST',
+      headers: adminHeaders(),
+      body: JSON.stringify({ account, durationSeconds, note }),
+    });
+    showMsg('License granted for account ' + account + '.', true);
+    loadLicenses();
+  } catch (e) {
+    showMsg('Error: ' + e.message, false);
+  }
+}
+
+async function revokeLicense(account) {
+  if (!confirm('Revoke access for account ' + account + ' right now?')) return;
+  try {
+    await apiFetch('/admin/revoke', {
+      method: 'POST',
+      headers: adminHeaders(),
+      body: JSON.stringify({ account }),
+    });
+    showMsg('Revoked ' + account + '. Their indicator will lock out on its next check-in.', true);
+    loadLicenses();
+  } catch (e) {
+    showMsg('Error: ' + e.message, false);
+  }
+}
+
+async function deleteLicense(account) {
+  if (!confirm('Remove account ' + account + ' entirely from the list?')) return;
+  try {
+    await apiFetch('/admin/delete', {
+      method: 'POST',
+      headers: adminHeaders(),
+      body: JSON.stringify({ account }),
+    });
+    showMsg('Deleted ' + account + '.', true);
+    loadLicenses();
+  } catch (e) {
+    showMsg('Error: ' + e.message, false);
+  }
+}
+
+function fmtExpiry(ts) {
+  if (!ts) return 'Never';
+  return new Date(ts).toLocaleString();
+}
+
+function statusOf(lic) {
+  if (lic.revoked) return { text: 'REVOKED', cls: 'status-revoked' };
+  if (lic.expiresAt && Date.now() > lic.expiresAt) return { text: 'EXPIRED', cls: 'status-expired' };
+  return { text: 'ACTIVE', cls: 'status-active' };
+}
+
+async function loadLicenses() {
+  try {
+    const data = await apiFetch('/admin/list', { headers: adminHeaders() });
+
+    const tbody = document.querySelector('#licTable tbody');
+    tbody.innerHTML = '';
+    data.licenses.forEach((lic) => {
+      const st = statusOf(lic);
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${lic.account}</td>
+        <td class="${st.cls}">${st.text}</td>
+        <td>${fmtExpiry(lic.expiresAt)}</td>
+        <td>${lic.note || ''}</td>
+        <td class="row-actions">
+          <button class="secondary danger" onclick="revokeLicense('${lic.account}')">Revoke</button>
+          <button class="secondary" onclick="deleteLicense('${lic.account}')">Delete</button>
+        </td>`;
+      tbody.appendChild(tr);
+    });
+  } catch (e) {
+    showMsg('Error loading licenses: ' + e.message, false);
+  }
+}
+</script>
+</body>
+</html>
